@@ -16,10 +16,12 @@ use super::SimpleResult;
 use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use indicatif::ProgressBar;
+use linkle::format::pfs0::Pfs0;
 use rayon::prelude::*;
 use sqlx::sqlite::SqliteConnection;
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
 use strum::VariantNames;
@@ -385,6 +387,22 @@ pub async fn import_rom<P: AsRef<Path>>(
             progress_bar,
             system,
             &game_ids,
+            &romfile_path,
+            hash_algorithm,
+            trash,
+            unattended,
+        )
+        .await?
+        {
+            system_ids.insert(ids[0]);
+            game_ids.insert(ids[1]);
+        };
+    } else if NSP_EXTENSION == romfile_extension {
+        if let Some(ids) = import_nsp(
+            &mut transaction,
+            progress_bar,
+            system,
+            header,
             &romfile_path,
             hash_algorithm,
             trash,
@@ -1210,6 +1228,105 @@ async fn import_zso<P: AsRef<Path>>(
             .await?;
         // persist in database
         create_or_update_romfile(connection, &new_zso_path, &[rom]).await;
+        Ok(Some([system.id, game.id]))
+    } else {
+        if trash {
+            move_to_trash(connection, progress_bar, romfile_path).await?;
+        }
+        Ok(None)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_nsp<P: AsRef<Path>>(
+    connection: &mut SqliteConnection,
+    progress_bar: &ProgressBar,
+    system: &Option<&System>,
+    header: &Option<Header>,
+    romfile_path: &P,
+    hash_algorithm: &HashAlgorithm,
+    trash: bool,
+    unattended: bool,
+) -> SimpleResult<Option<[i64; 2]>> {
+    let tmp_directory = create_tmp_directory(connection).await?;
+    let file = try_with!(File::open(romfile_path.as_ref()), "Failed to open file");
+    let pfs0 = try_with!(Pfs0::from_reader(file), "Failed to parse PFS0");
+
+    let mut game_ids: HashSet<i64> = HashSet::new();
+    let mut found_rom: Option<Rom> = None;
+    let mut found_game: Option<Game> = None;
+    let mut found_system: Option<System> = None;
+
+    for pfs0_file in pfs0.files() {
+        let mut pfs0_file = try_with!(pfs0_file, "Failed to read PFS0 file");
+        progress_bar.println(format!(
+            "Processing \"{} ({})\"",
+            pfs0_file.file_name(),
+            romfile_path.as_ref().file_name().unwrap().to_str().unwrap()
+        ));
+
+        let mut extracted_path = tmp_directory.path().to_owned();
+        extracted_path.push(pfs0_file.file_name());
+
+        let mut out_file = try_with!(File::create(&extracted_path), "Failed to open output file");
+        try_with!(
+            std::io::copy(&mut pfs0_file, &mut out_file),
+            "Failed to extract file"
+        );
+
+        let romfile = CommonRomfile {
+            path: extracted_path.clone(),
+        };
+        let (hash, size) = romfile
+            .get_hash_and_size(connection, progress_bar, header, 1, 1, hash_algorithm)
+            .await?;
+        remove_file(progress_bar, &extracted_path, true).await?;
+
+        let path = Path::new(pfs0_file.file_name());
+
+        let mut game_names: Vec<&str> = Vec::new();
+        game_names.push(romfile_path.as_ref().file_stem().unwrap().to_str().unwrap());
+        if let Some(path) = path.parent() {
+            let game_name = path.as_os_str().to_str().unwrap();
+            if !game_name.is_empty() {
+                game_names.push(game_name);
+            }
+        }
+        let rom_name = path.file_name().unwrap().to_str();
+
+        if let Some((rom, game, system)) = find_rom_by_size_and_hash(
+            connection,
+            progress_bar,
+            size,
+            &hash,
+            system,
+            &game_ids,
+            game_names,
+            rom_name,
+            hash_algorithm,
+            unattended,
+        )
+        .await?
+        {
+            game_ids.insert(game.id);
+            found_rom = Some(rom);
+            found_game = Some(game);
+            found_system = Some(system);
+        }
+    }
+
+    if game_ids.len() == 1 {
+        let game = found_game.unwrap();
+        let system = found_system.unwrap();
+        let system_directory = get_system_directory(connection, &system).await?;
+        let new_path = system_directory.join(format!("{}.nsp", &game.name));
+
+        // move file
+        rename_file(progress_bar, romfile_path, &new_path, false).await?;
+
+        // persist in database
+        create_or_update_romfile(connection, &new_path, &[found_rom.unwrap()]).await;
+
         Ok(Some([system.id, game.id]))
     } else {
         if trash {
