@@ -8,6 +8,7 @@ use super::dolphin;
 use super::maxcso;
 use super::model::*;
 use super::nsz;
+use super::progress::*;
 use super::prompt::*;
 use super::sevenzip;
 use super::sevenzip::ArchiveFile;
@@ -22,6 +23,7 @@ use sqlx::sqlite::SqliteConnection;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::path::PathBuf;
 use strum::VariantNames;
@@ -406,7 +408,6 @@ pub async fn import_rom<P: AsRef<Path>>(
             &romfile_path,
             hash_algorithm,
             trash,
-            unattended,
         )
         .await?
         {
@@ -1246,7 +1247,6 @@ async fn import_nsp<P: AsRef<Path>>(
     romfile_path: &P,
     hash_algorithm: &HashAlgorithm,
     trash: bool,
-    unattended: bool,
 ) -> SimpleResult<Option<[i64; 2]>> {
     let tmp_directory = create_tmp_directory(connection).await?;
     let file = try_with!(File::open(romfile_path.as_ref()), "Failed to open file");
@@ -1268,11 +1268,19 @@ async fn import_nsp<P: AsRef<Path>>(
         let mut extracted_path = tmp_directory.path().to_owned();
         extracted_path.push(pfs0_file.file_name());
 
+        let length = try_with!(pfs0_file.seek(SeekFrom::End(0)), "Failed to seek");
+        try_with!(pfs0_file.seek(SeekFrom::Start(0)), "Failed to seek");
         let mut out_file = try_with!(File::create(&extracted_path), "Failed to open output file");
+        progress_bar.reset();
+        progress_bar.set_message("Copying file");
+        progress_bar.set_style(get_bytes_progress_style());
+        progress_bar.set_length(length);
         try_with!(
-            std::io::copy(&mut pfs0_file, &mut out_file),
+            std::io::copy(&mut progress_bar.wrap_read(&mut pfs0_file), &mut out_file),
             "Failed to extract file"
         );
+        progress_bar.set_message("");
+        progress_bar.set_style(get_none_progress_style());
 
         let romfile = CommonRomfile {
             path: extracted_path.clone(),
@@ -1304,7 +1312,7 @@ async fn import_nsp<P: AsRef<Path>>(
             game_names,
             rom_name,
             hash_algorithm,
-            unattended,
+            true,
         )
         .await?
         {
